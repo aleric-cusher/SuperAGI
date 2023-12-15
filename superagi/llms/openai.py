@@ -1,3 +1,4 @@
+import re
 import openai
 from openai import APIError, InvalidRequestError
 from openai.error import RateLimitError, AuthenticationError, Timeout, TryAgain
@@ -7,9 +8,9 @@ from superagi.config.config import get_config
 from superagi.lib.logger import logger
 from superagi.llms.base_llm import BaseLlm
 
-MAX_RETRY_ATTEMPTS = 5
-MIN_WAIT = 30 # Seconds
-MAX_WAIT = 300 # Seconds  
+MAX_RETRY_ATTEMPTS = 6
+MIN_WAIT = 45 # Seconds
+MAX_WAIT = 600 # Seconds
 
 def custom_retry_error_callback(retry_state):
     logger.info("OpenAi Exception:", retry_state.outcome.exception())
@@ -41,6 +42,7 @@ class OpenAi(BaseLlm):
         self.api_key = api_key
         openai.api_key = api_key
         openai.api_base = get_config("OPENAI_API_BASE", "https://api.openai.com/v1")
+        self.context_error_retry = 0
 
     def get_source(self):
         return "openai"
@@ -94,6 +96,7 @@ class OpenAi(BaseLlm):
                 presence_penalty=self.presence_penalty
             )
             content = response.choices[0].message["content"]
+            self.context_error_retry = 0
             return {"response": response, "content": content}
         except RateLimitError as api_error:
             logger.info("OpenAi RateLimitError:", api_error)
@@ -108,8 +111,21 @@ class OpenAi(BaseLlm):
             logger.info("OpenAi AuthenticationError:", auth_error)
             return {"error": "ERROR_AUTHENTICATION", "message": "Authentication error please check the api keys: "+str(auth_error)}
         except InvalidRequestError as invalid_request_error:
+            err_str = str(invalid_request_error)
             logger.info("OpenAi InvalidRequestError:", invalid_request_error)
-            return {"error": "ERROR_INVALID_REQUEST", "message": "Openai invalid request error: "+str(invalid_request_error)}
+
+            if 'Please reduce the length of the messages or completion' in err_str and self.context_error_retry < 2:
+                # Openai invalid request error: This model's maximum context length is 8192 tokens.
+                # However, you requested 8641 tokens (4609 in the messages, 4032 in the completion).
+                # Please reduce the length of the messages or completion.
+                logger.info("Reducing max_token size and trying again!")
+                self.context_error_retry += 1
+                nums_in_err = list(map(int, re.findall(r'\d+', err_str)))
+                max_context, current_context = nums_in_err[0], nums_in_err[1]
+                context_diff = current_context - max_context
+                return self.chat_completion(messages, max_tokens-context_diff-5)
+
+            return {"error": "ERROR_INVALID_REQUEST", "message": "Openai invalid request error: " + err_str}
         except Exception as exception:
             logger.info("OpenAi Exception:", exception)
             return {"error": "ERROR_OPENAI", "message": "Open ai exception: "+str(exception)}
